@@ -4,8 +4,6 @@ import socket
 import threading
 import queue
 
-root = tk.Tk()
-
 # Tkinter canvas seems to clips the left side of some text if we draw to 0,0
 # so we offset all x coordinates by LEFT_PAD
 LEFT_PAD = 3
@@ -23,15 +21,21 @@ MODIFIER_KEYS = {
     '131076': 'RightShift'
 }
 
+# Global queue for connection requests
+connection_queue = queue.Queue()
 
-def handle_conn(conn):
+
+def handle_conn(conn, root):
+    """Handle a connection to the socket canvas.
+    This function must be called from the main thread."""
+
     def send_event(*args):
         conn.send((','.join(map(str, args)) + '\n').encode())
 
     # Queue for sending commands received on the socket to the canvas
     cmd_queue = queue.Queue()
-    window = Toplevel()
-    window.wm_title("Hello")
+    window = Toplevel(root)
+    window.wm_title("Socket Canvas")
 
     canvas_width = 800
     canvas_height = 600
@@ -75,10 +79,21 @@ def handle_conn(conn):
     def on_quit(event):
         window.destroy()
 
+    def on_window_close():
+        try:
+            conn.close()
+        except:
+            pass
+        window.destroy()
+
     def process_commands():
         while not cmd_queue.empty():
             command = cmd_queue.get(0).strip()
             print(f'Received command: {command}')
+
+            if not command:
+                window.after(10, process_commands)
+                return
 
             command, _, remaining = command.partition(',')
             if command == 'quit':
@@ -89,29 +104,33 @@ def handle_conn(conn):
 
             if command == 'clear':
                 w.delete("all")
+                window.after(10, process_commands)
                 continue
 
-            x, _, remaining = remaining.partition(',')
-            x = int(x) + LEFT_PAD
+            try:
+                x, _, remaining = remaining.partition(',')
+                x = int(x) + LEFT_PAD
 
-            y, _, remaining = remaining.partition(',')
-            y = int(y) + TOP_PAD
+                y, _, remaining = remaining.partition(',')
+                y = int(y) + TOP_PAD
 
-            if command == 'rect':
-                width, _, remaining = remaining.partition(',')
-                height, _, color = remaining.partition(',')
-                width = int(width)
-                height = int(height)
-                print(f'color: {color}')
-                w.create_rectangle(x, y, x + width, y +
-                                   height, fill=color, width=0)
+                if command == 'rect':
+                    width, _, remaining = remaining.partition(',')
+                    height, _, color = remaining.partition(',')
+                    width = int(width)
+                    height = int(height)
+                    print(f'color: {color}')
+                    w.create_rectangle(x, y, x + width, y +
+                                       height, fill=color, width=0)
 
-            if command == 'text':
-                color, _, text = remaining.partition(',')
-                w.create_text(x, y, text=text, anchor=NW,
-                              fill=color, font='Courier')
+                if command == 'text':
+                    color, _, text = remaining.partition(',')
+                    w.create_text(x, y, text=text, anchor=NW,
+                                  fill=color, font='Courier')
+            except Exception as e:
+                print(f"Error processing command: {e}")
 
-        w.after(10, process_commands)
+        window.after(10, process_commands)
 
     w.bind("<Button-1>", on_mousedown)
     w.bind("<ButtonRelease-1>", on_mouseup)
@@ -120,23 +139,28 @@ def handle_conn(conn):
     w.bind("<KeyRelease>", on_keyup)
     w.bind("<Control-q>", on_quit)
     w.bind("<Configure>", on_configure)
+    window.protocol("WM_DELETE_WINDOW", on_window_close)
 
     def read_commands():
         buffer = ''
         while True:
-            data = conn.recv(100).decode()
-            if not data:
+            try:
+                data = conn.recv(100).decode()
+                if not data:
+                    break
+
+                buffer = buffer + data
+                index = buffer.find('\n')
+                while index != -1:
+                    command = buffer[0:index]
+                    if len(command) > 0:
+                        cmd_queue.put(command)
+                    buffer = buffer[index + 1:]
+                    index = buffer.find('\n')
+            except:
                 break
 
-            buffer = buffer + data
-            index = buffer.find('\n')
-            while index != -1:
-                command = buffer[0:index]
-                if len(command) > 0:
-                    cmd_queue.put(command)
-                buffer = buffer[index + 1:]
-                index = buffer.find('\n')
-
+        # Signal that the connection is closing
         cmd_queue.put('quit')
 
     thread = threading.Thread(target=read_commands)
@@ -144,32 +168,66 @@ def handle_conn(conn):
     thread.start()
 
     process_commands()
+    return window
 
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-print('Listening on 5005...')
-sock.bind(('127.0.0.1', 5005))
-sock.listen(1)
-
-
-def listen():
+def accept_connections(sock):
+    """Accept connections and put them in a queue for the main thread to process."""
     while True:
-        conn, addr = sock.accept()
-        print('Connection accepted...')
-
-        handle_conn(conn)
-
-
-listen_thread = threading.Thread(target=listen)
-listen_thread.daemon = True
-listen_thread.start()
+        try:
+            conn, addr = sock.accept()
+            print('Connection accepted...')
+            connection_queue.put(conn)
+        except:
+            break
 
 
-def handle_close():
-    root.destroy()
+def check_connections(root):
+    """Check for new connections and handle them in the main thread."""
+    try:
+        while not connection_queue.empty():
+            conn = connection_queue.get(0)
+            handle_conn(conn, root)
+    except Exception as e:
+        print(f"Error handling connection: {e}")
+
+    # Schedule the next check
+    root.after(100, lambda: check_connections(root))
 
 
-root.protocol("WM_DELETE_WINDOW", handle_close)
-root.mainloop()
+def main():
+    """Main function to run the socket canvas server."""
+    root = tk.Tk()
+    root.title("Socket Canvas Server")
+    root.geometry("300x100")
+
+    # Create and place a simple label
+    label = tk.Label(
+        root, text="Socket Canvas Server\nListening on 127.0.0.1:5005")
+    label.pack(expand=YES, fill=BOTH, padx=10, pady=10)
+
+    # Set up the socket server
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    print('Listening on 127.0.0.1:5005...')
+    sock.bind(('127.0.0.1', 5005))
+    sock.listen(5)
+
+    # Start a thread to accept connections
+    accept_thread = threading.Thread(target=accept_connections, args=(sock,))
+    accept_thread.daemon = True
+    accept_thread.start()
+
+    # Schedule the connection check
+    root.after(100, lambda: check_connections(root))
+
+    def handle_close():
+        sock.close()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", handle_close)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
